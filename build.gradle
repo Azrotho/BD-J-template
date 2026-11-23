@@ -1,0 +1,272 @@
+plugins {
+    id 'java'
+}
+
+// =====================================================================
+//  Template BD-J (Blu-ray Java) : compile, assemble, signe et lance
+//  un disque Blu-ray depuis Gradle.
+//
+//  Tâches principales (groupe "bd-j") :
+//    ./gradlew assembleBDMV   -> build/disc/        (arborescence BDMV signée)
+//    ./gradlew buildISO       -> build/game.iso     (image UDF 2.50)
+//    ./gradlew runVLC         -> lance le disque dans VLC
+//
+//  Le SDK (stubs BD-J, template AVCHD, signer, makefs) est téléchargé
+//  automatiquement dans .bdj-sdk/ au premier build (ignoré par git).
+//  Prérequis : git, java 8 (toolchain), et pour buildISO : gcc, make,
+//  pkg-config, libbsd-dev ; pour runVLC : vlc.
+// =====================================================================
+
+// --- Configuration du projet -----------------------------------------
+def initialClass = 'fr.azrotho.Main'   // Classe Xlet principale
+def discLabel    = 'BDJ_GAME'
+
+// Le template du SDK est lié à cette classe d'origine (cf. patchBdjo)
+def templateClass = 'org.homebrew.MyXlet'
+
+// --- SDK (version figée pour des builds reproductibles) --------------
+def sdkRepo   = 'https://github.com/john-tornblom/bdj-sdk.git'
+def sdkCommit = '9c48049b920514388952ea89cda13fc940ff2183'
+def sdkDir    = file('.bdj-sdk')
+def sdkStubs  = file("${sdkDir}/target/lib/enhanced-stubs.zip")
+def sdkMakefs = file("${sdkDir}/host/bin/makefs")
+
+// --- Dossiers de sortie ----------------------------------------------
+def discDir = file("${buildDir}/disc")
+def bdmvDir = file("${discDir}/BDMV")
+def isoFile = file("${buildDir}/game.iso")
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+}
+
+dependencies {
+    compileOnly files(sdkStubs)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    sourceCompatibility = '1.3'
+    targetCompatibility = '1.3'
+    options.compilerArgs << '-Xlint:-options'
+}
+
+// --- Utilitaires -----------------------------------------------------
+def runCmd = { List<String> cmd, File workDir = null ->
+    def pb = new ProcessBuilder(cmd)
+    if (workDir != null) pb.directory(workDir)
+    pb.inheritIO()
+    int exitVal
+    try {
+        exitVal = pb.start().waitFor()
+    } catch (IOException e) {
+        throw new GradleException("Impossible de lancer '${cmd[0]}' (est-il installé ?) : ${e.message}")
+    }
+    if (exitVal != 0) {
+        throw new GradleException("Commande échouée (code ${exitVal}): ${cmd.join(' ')}")
+    }
+}
+
+def copyFile = { File src, File dst ->
+    dst.parentFile.mkdirs()
+    java.nio.file.Files.copy(src.toPath(), dst.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+}
+
+def copyDir = { File src, File dst ->
+    dst.mkdirs()
+    src.eachFileRecurse { f ->
+        def target = dst.toPath().resolve(src.toPath().relativize(f.toPath()))
+        if (f.isDirectory()) {
+            target.toFile().mkdirs()
+        } else {
+            target.parent.toFile().mkdirs()
+            java.nio.file.Files.copy(f.toPath(), target, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+}
+
+// Génère un 00000.bdjo à partir de celui du template en remplaçant la
+// classe initiale, et en recalculant les champs de longueur/offsets.
+def patchBdjo = { File template, String oldClass, String newClass ->
+    byte[] src = template.bytes
+    byte[] oldB = oldClass.getBytes('US-ASCII')
+    byte[] newB = newClass.getBytes('US-ASCII')
+
+    int pos = -1
+    for (int i = 1; i <= src.length - oldB.length && pos < 0; i++) {
+        if (java.util.Arrays.equals(java.util.Arrays.copyOfRange(src, i, i + oldB.length), oldB)) pos = i
+    }
+    if (pos < 0 || (src[pos - 1] & 0xff) != oldB.length) {
+        throw new GradleException("Template BDJO inattendu : classe '${oldClass}' introuvable dans ${template}")
+    }
+    if (newB.length > 255) throw new GradleException("Nom de classe trop long : ${newClass}")
+
+    int delta = newB.length - oldB.length
+    def out = new ByteArrayOutputStream()
+    out.write(src, 0, pos - 1)
+    out.write(newB.length)
+    out.write(newB, 0, newB.length)
+    out.write(src, pos + oldB.length, src.length - pos - oldB.length)
+    byte[] res = out.toByteArray()
+
+    def buf = java.nio.ByteBuffer.wrap(res)        // big-endian
+    // 0x18 / 0x1c : offsets des sections situées après le nom de classe
+    // 0x58        : longueur de l'Application Management Table
+    // 0x68        : longueur de l'entrée d'application
+    [0x18, 0x1c, 0x58, 0x68].each { off -> buf.putInt(off, buf.getInt(off) + delta) }
+    return res
+}
+
+// =====================================================================
+// 1. SDK
+// =====================================================================
+
+tasks.register('setupSdk') {
+    group = 'bd-j'
+    description = 'Télécharge le SDK BD-J (stubs, template AVCHD, signer) dans .bdj-sdk/'
+
+    onlyIf {
+        !file("${sdkDir}/resources/sig.ks").exists() ||
+        !sdkStubs.exists() ||
+        !file("${sdkDir}/host/src/makefs_termux/Makefile").exists()
+    }
+
+    doLast {
+        sdkDir.deleteDir()
+        logger.lifecycle("==> Téléchargement de bdj-sdk @ ${sdkCommit.take(8)}...")
+        sdkDir.mkdirs()
+        runCmd(['git', 'init', '-q'], sdkDir)
+        runCmd(['git', 'remote', 'add', 'origin', sdkRepo], sdkDir)
+        runCmd(['git', 'fetch', '-q', '--depth', '1', 'origin', sdkCommit], sdkDir)
+        runCmd(['git', 'checkout', '-q', 'FETCH_HEAD'], sdkDir)
+        runCmd(['git', 'submodule', 'update', '--init', '--recursive', '--depth', '1'], sdkDir)
+    }
+}
+
+tasks.register('buildMakefs') {
+    group = 'bd-j'
+    description = 'Compile makefs (outil de création d\'ISO UDF) depuis le SDK'
+    dependsOn tasks.named('setupSdk')
+
+    onlyIf { !sdkMakefs.exists() }
+
+    doLast {
+        def src = file("${sdkDir}/host/src/makefs_termux")
+        sdkMakefs.parentFile.mkdirs()
+        logger.lifecycle('==> Compilation de makefs...')
+        // Le Makefile d'origine impose un link statique (-static) et échoue avec
+        // les GCC récents : on compile donc directement.
+        runCmd(['sh', '-c',
+                'cc -w -Wno-error=implicit-function-declaration -Wno-error=int-conversion ' +
+                        '-D_GNU_SOURCE -std=c11 -I./udf $(pkg-config --cflags libbsd-overlay) ' +
+                        '-o "' + sdkMakefs.absolutePath + '" ' +
+                        'udf.c strstuff.c makefs.c walk.c udf_core.c udf_osta.c ' +
+                        '$(pkg-config --libs libbsd-overlay) -lm'], src)
+    }
+}
+
+// =====================================================================
+// 2. COMPILATION / JAR
+// =====================================================================
+
+tasks.named('compileJava') {
+    dependsOn tasks.named('setupSdk')
+}
+
+tasks.named('jar', Jar) {
+    archiveFileName = '00000.jar'
+}
+
+// =====================================================================
+// 3. ASSEMBLAGE DU DISQUE
+// =====================================================================
+
+tasks.register('assembleBDMV') {
+    group = 'bd-j'
+    description = 'Assemble et signe l\'arborescence BDMV/ dans build/disc/'
+    dependsOn tasks.named('jar'), tasks.named('setupSdk')
+
+    doLast {
+        // 1. Template AVCHD du SDK (index, playlist, certificats, vidéo...)
+        discDir.deleteDir()
+        copyDir(file("${sdkDir}/resources/AVCHD"), discDir)
+
+        // 2. JAR de l'application
+        def jarOut = new File(bdmvDir, 'JAR/00000.jar')
+        copyFile(tasks.jar.archiveFile.get().asFile, jarOut)
+
+        // 3. BDJO (classe initiale) + sauvegarde
+        byte[] bdjo = patchBdjo(file("${sdkDir}/resources/AVCHD/BDMV/BDJO/00000.bdjo"), templateClass, initialClass)
+        ['BDJO', 'BACKUP/BDJO'].each { dir ->
+            def f = new File(bdmvDir, "${dir}/00000.bdjo")
+            f.parentFile.mkdirs()
+            f.bytes = bdjo
+        }
+
+        // 4. Assets externes au JAR (placés dans /assets à la racine du Blu-ray
+        //    pour ne pas consommer la limite de ~4 Mo du JAR / AppCache)
+        def assetsDir = file('assets')
+        if (assetsDir.exists()) {
+            copyDir(assetsDir, new File(discDir, 'assets'))
+        }
+
+        // 5. Signature du JAR (Java 8 requis par le signer)
+        //    BDSigner génère un dossier temporaire META-INF/ dans son répertoire
+        //    courant : on l'exécute dans build/tmp pour garder la racine propre.
+        def signerWorkDir = file("${buildDir}/tmp/signer")
+        signerWorkDir.mkdirs()
+        def java8 = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(8) }.get()
+        logger.lifecycle('==> Signature du JAR...')
+        runCmd([java8.executablePath.asFile.absolutePath,
+                '-cp', "${sdkDir}/host/lib/*".toString(),
+                'net.java.bd.tools.security.BDSigner',
+                '-keystore', "${sdkDir}/resources/sig.ks".toString(),
+                jarOut.absolutePath], signerWorkDir)
+
+        logger.lifecycle("==> Disque assemblé : ${discDir} (classe initiale : ${initialClass})")
+    }
+}
+
+tasks.register('buildISO') {
+    group = 'bd-j'
+    description = 'Construit l\'image ISO UDF 2.50 (build/game.iso)'
+    dependsOn tasks.named('assembleBDMV'), tasks.named('buildMakefs')
+
+    doLast {
+        isoFile.delete()
+        long totalBytes = 0L
+        discDir.eachFileRecurse { f -> if (f.isFile()) totalBytes += f.length() }
+        // Marge pour les métadonnées UDF 2.50 (minimum 16 Mo)
+        long sizeMb = Math.max(16L, ((long) (totalBytes / (1024L * 1024L))) + 16L)
+        if (sizeMb % 2L != 0L) sizeMb++
+
+        runCmd([sdkMakefs.absolutePath, '-m', "${sizeMb}m".toString(), '-t', 'udf',
+                '-o', "T=bdre,v=2.50,L=${discLabel}".toString(),
+                isoFile.absolutePath, discDir.absolutePath])
+        logger.lifecycle("==> ISO générée : ${isoFile} (${sizeMb} Mo)")
+    }
+}
+
+tasks.register('runVLC', Exec) {
+    group = 'bd-j'
+    description = 'Lance le Blu-ray directement dans VLC (avec menus / BD-J)'
+    dependsOn tasks.named('assembleBDMV')
+
+    commandLine 'vlc', "bluray://${discDir.absolutePath}", '--bluray-menu'
+
+    // libbluray lance la JVM BD-J via JAVA_HOME. Les Java >= 18 (SecurityManager
+    // supprimé) font échouer BD-J : on force la JVM 8 de la toolchain.
+    doFirst {
+        def java8 = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(8) }.get()
+        environment 'JAVA_HOME', java8.metadata.installationPath.asFile.absolutePath
+    }
+
+    // VLC renvoie souvent un code non nul à la fermeture : ne pas faire échouer le build
+    ignoreExitValue = true
+}
+
+tasks.named('build') {
+    dependsOn tasks.named('assembleBDMV')
+}
