@@ -1,19 +1,26 @@
 package fr.azrotho;
 
-public class Main extends java.awt.Container implements javax.tv.xlet.Xlet {
+import org.havi.ui.HScene;
+import org.havi.ui.HSceneFactory;
 
-    private org.havi.ui.HScene scene;
-    private java.awt.Font font;
-    private java.awt.Image image;
+import javax.tv.xlet.Xlet;
+import javax.tv.xlet.XletContext;
+import java.awt.*;
 
-    public void initXlet(javax.tv.xlet.XletContext context) {
+public class Main extends Container implements Xlet {
+
+    private HScene scene;
+    private Font font;
+    private Image image;
+
+    public void initXlet(XletContext context) {
         setSize(1280, 720);
         try {
             image = AssetLoader.loadImage("img/kekw.png");
         } catch (java.io.IOException e) {
             e.printStackTrace();
         }
-        scene = org.havi.ui.HSceneFactory.getInstance().getDefaultHScene();
+        scene = HSceneFactory.getInstance().getDefaultHScene();
         scene.add(this);
         scene.validate();
     }
@@ -37,8 +44,8 @@ public class Main extends java.awt.Container implements javax.tv.xlet.Xlet {
         }
     }
 
-    public void paint(java.awt.Graphics g) {
-        g.setColor(new java.awt.Color(0x000000));
+    public void paint(Graphics g) {
+        g.setColor(new Color(0x000000));
         g.fillRect(0, 0, getWidth(), getHeight());
         if (image != null) {
             int size = 400;
@@ -46,11 +53,11 @@ public class Main extends java.awt.Container implements javax.tv.xlet.Xlet {
             int y = (getHeight() - size) / 2;
             g.drawImage(image, x, y, size, size, this);
         }
-        g.setColor(new java.awt.Color(0xffffff));
+        g.setColor(new Color(0xffffff));
         if (font == null) {
-            font = new java.awt.Font(null, java.awt.Font.PLAIN, 30);
+            font = new Font(null, Font.PLAIN, 30);
         }
         g.setFont(font);
-        g.drawString("Hello World!", 50, 50);
+        g.drawString("Hello World!!!! :333", 50, 50);
     }
 }
