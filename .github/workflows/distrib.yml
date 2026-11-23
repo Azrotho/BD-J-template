@@ -33,3 +33,10 @@ jobs:
 
         - name: Build ISO with Gradle
           run: ./gradlew buildISO
+
+        - name: Upload ISO artifact
+          uses: actions/upload-artifact@v7
+          with:
+            name: bdj-template-iso
+            path: build/*.iso
+            retention-days: 7
