@@ -1,10 +1,11 @@
 package fr.azrotho;
 
-import java.awt.Component;
 import java.awt.Font;
 import java.awt.Image;
-import java.awt.MediaTracker;
 import java.awt.Toolkit;
+import java.awt.image.ImageConsumer;
+import java.awt.image.ImageObserver;
+import java.awt.image.ImageProducer;
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -14,6 +15,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.UnsupportedEncodingException;
 import java.net.URL;
 import java.util.Enumeration;
 import java.util.Hashtable;
@@ -41,7 +43,12 @@ public final class AssetLoader {
 
     private static final String ASSETS_DIR_NAME = "assets";
     private static final Hashtable IMAGE_CACHE = new Hashtable();
-    private static Component trackerComponent;
+    private static int imageCacheGeneration = 0;
+    private static final long IMAGE_LOAD_TIMEOUT_MS = 30000L;
+    private static final char[] HEX_DIGITS = {
+        '0', '1', '2', '3', '4', '5', '6', '7',
+        '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'
+    };
 
     private AssetLoader() {
     }
@@ -216,10 +223,14 @@ public final class AssetLoader {
      */
     public static Image loadImage(String path, boolean cache) throws IOException {
         String key = normalizeRelativePath(path);
+        int cacheGen = 0;
         if (cache) {
-            Image cached = (Image) IMAGE_CACHE.get(key);
-            if (cached != null) {
-                return cached;
+            synchronized (IMAGE_CACHE) {
+                Image cached = (Image) IMAGE_CACHE.get(key);
+                if (cached != null) {
+                    return cached;
+                }
+                cacheGen = imageCacheGeneration;
             }
         }
 
@@ -228,7 +239,16 @@ public final class AssetLoader {
         waitForImage(img);
 
         if (cache && img != null) {
-            IMAGE_CACHE.put(key, img);
+            synchronized (IMAGE_CACHE) {
+                if (cacheGen == imageCacheGeneration) {
+                    Image existing = (Image) IMAGE_CACHE.get(key);
+                    if (existing != null) {
+                        img.flush();
+                        return existing;
+                    }
+                    IMAGE_CACHE.put(key, img);
+                }
+            }
         }
         return img;
     }
@@ -238,6 +258,7 @@ public final class AssetLoader {
      */
     public static void clearImageCache() {
         synchronized (IMAGE_CACHE) {
+            imageCacheGeneration++;
             Enumeration e = IMAGE_CACHE.elements();
             while (e.hasMoreElements()) {
                 Image img = (Image) e.nextElement();
@@ -263,7 +284,7 @@ public final class AssetLoader {
             throw new FileNotFoundException("Son introuvable : " + file.getAbsolutePath());
         }
         HSound sound = new HSound();
-        sound.load(file.getAbsolutePath());
+        sound.load(toFileUrl(file));
         return sound;
     }
 
@@ -285,7 +306,7 @@ public final class AssetLoader {
             throw new FileNotFoundException("Audio introuvable : " + file.getAbsolutePath());
         }
         try {
-            URL url = new URL("file:" + file.getAbsolutePath());
+            URL url = toFileUrl(file);
             return Manager.createPlayer(url);
         } catch (NoPlayerException e) {
             throw new IOException("Aucun lecteur JMF disponible pour " + file.getAbsolutePath() + " : " + e.getMessage());
@@ -300,11 +321,14 @@ public final class AssetLoader {
      * Charge une police {@code .otf}/{@code .ttf} depuis {@code assets/}.
      */
     public static Font loadFont(String path, String fontName, int style, int size) throws Exception {
+        if (fontName == null) {
+            throw new IllegalArgumentException("Nom de police null");
+        }
         File file = getFile(path);
         if (!file.exists()) {
             throw new FileNotFoundException("Police introuvable : " + file.getAbsolutePath());
         }
-        FontFactory factory = new FontFactory(new URL("file:" + file.getAbsolutePath()));
+        FontFactory factory = new FontFactory(toFileUrl(file));
         return factory.createFont(fontName, style, size);
     }
 
@@ -312,27 +336,139 @@ public final class AssetLoader {
     // Utilitaires internes
     // -------------------------------------------------------------------------
 
-    private static synchronized Component getTrackerComponent() {
-        if (trackerComponent == null) {
-            trackerComponent = new Component() {
-            };
+    private static void removeConsumerQuietly(Image image) {
+        if (image instanceof ImageConsumer) {
+            ImageProducer producer = image.getSource();
+            if (producer != null) {
+                producer.removeConsumer((ImageConsumer) image);
+            }
         }
-        return trackerComponent;
     }
 
-    private static void waitForImage(Image img) throws IOException {
+    private static boolean hasImageError(Image image) {
+        Object err = image.getProperty("error", null);
+        if (err != null && err != Image.UndefinedProperty) {
+            return true;
+        }
+        return image.getWidth(null) <= 0 || image.getHeight(null) <= 0;
+    }
+
+    private static URL toFileUrl(File file) throws IOException {
+        String absPath = file.getAbsolutePath().replace(File.separatorChar, '/');
+        if (!absPath.startsWith("/")) {
+            absPath = "/" + absPath;
+        }
+        byte[] utf8;
+        try {
+            utf8 = absPath.getBytes("UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            utf8 = absPath.getBytes();
+        }
+        StringBuffer encoded = new StringBuffer(utf8.length + 16);
+        for (int i = 0; i < utf8.length; i++) {
+            int b = utf8[i] & 0xFF;
+            boolean unreserved = (b >= 'A' && b <= 'Z')
+                || (b >= 'a' && b <= 'z')
+                || (b >= '0' && b <= '9')
+                || b == '/' || b == '-' || b == '_' || b == '.' || b == '~';
+            if (unreserved || (b == ':' && i == 2 && utf8.length > 3 && utf8[3] == '/')) {
+                encoded.append((char) b);
+            } else {
+                encoded.append('%');
+                encoded.append(HEX_DIGITS[(b >> 4) & 0x0F]);
+                encoded.append(HEX_DIGITS[b & 0x0F]);
+            }
+        }
+        return new URL("file", "", encoded.toString());
+    }
+
+    private static void waitForImage(final Image img) throws IOException {
         if (img == null) {
             throw new IOException("Impossible de creer l'image");
         }
-        MediaTracker tracker = new MediaTracker(getTrackerComponent());
-        tracker.addImage(img, 0);
-        try {
-            tracker.waitForID(0);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Chargement de l'image interrompu");
+        final Object lock = new Object();
+        final int[] state = new int[1]; // 0 = en cours, 1 = OK, -1 = erreur, -2 = timeout
+
+        ImageObserver observer = new ImageObserver() {
+            public boolean imageUpdate(Image image, int infoflags, int x, int y, int width, int height) {
+                if ((infoflags & ImageObserver.ALLBITS) != 0) {
+                    // Contournement d'un bug de libbluray : BDImageConsumer.imageComplete(STATICIMAGEDONE)
+                    // ne se desinscrit pas de l'ImageProducer, ce qui pousse InputStreamImageSource.doFetch()
+                    // a envoyer IMAGEERROR dans son bloc finally juste apres un decodage reussi.
+                    // En cas d'erreur de decodage (ex. PNGImageDecoder), le decodeur peut aussi definir
+                    // la propriete "error" avant STATICIMAGEDONE sans jamais envoyer IMAGEERROR.
+                    removeConsumerQuietly(image);
+                    boolean failed = hasImageError(image);
+                    synchronized (lock) {
+                        if (failed) {
+                            if (state[0] == 0) {
+                                state[0] = -1;
+                            }
+                        } else {
+                            state[0] = 1;
+                        }
+                        lock.notifyAll();
+                    }
+                    return false;
+                }
+                if ((infoflags & (ImageObserver.ERROR | ImageObserver.ABORT)) != 0) {
+                    removeConsumerQuietly(image);
+                    synchronized (lock) {
+                        if (state[0] == 0) {
+                            state[0] = -1;
+                        }
+                        lock.notifyAll();
+                    }
+                    return false;
+                }
+                return true;
+            }
+        };
+
+        if (Toolkit.getDefaultToolkit().prepareImage(img, -1, -1, observer)) {
+            removeConsumerQuietly(img);
+            if (hasImageError(img)) {
+                throw new IOException("Erreur lors du decodage de l'image");
+            }
+            return;
         }
-        if (tracker.isErrorID(0)) {
+
+        long deadline = System.currentTimeMillis() + IMAGE_LOAD_TIMEOUT_MS;
+        synchronized (lock) {
+            while (state[0] == 0) {
+                int flags = Toolkit.getDefaultToolkit().checkImage(img, -1, -1, null);
+                if ((flags & ImageObserver.ALLBITS) != 0) {
+                    removeConsumerQuietly(img);
+                    state[0] = hasImageError(img) ? -1 : 1;
+                    break;
+                }
+                if ((flags & (ImageObserver.ERROR | ImageObserver.ABORT)) != 0) {
+                    removeConsumerQuietly(img);
+                    state[0] = -1;
+                    break;
+                }
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0L) {
+                    removeConsumerQuietly(img);
+                    state[0] = -2;
+                    break;
+                }
+                long waitMs = remaining < 50L ? remaining : 50L;
+                try {
+                    lock.wait(waitMs);
+                } catch (InterruptedException e) {
+                    removeConsumerQuietly(img);
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Chargement de l'image interrompu");
+                }
+            }
+        }
+
+        if (state[0] == -2) {
+            throw new IOException("Delai d'attente depasse lors du decodage de l'image");
+        }
+        if (state[0] < 0 || hasImageError(img)) {
+            removeConsumerQuietly(img);
             throw new IOException("Erreur lors du decodage de l'image");
         }
     }
